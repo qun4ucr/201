@@ -27,8 +27,8 @@ struct my_exp {
     string op;
 
     my_exp(StringRef _op1, unsigned int _op, StringRef _op2) {
-        this->op1 = _op1.str();
-        this->op2 = _op2.str();
+        this->op1 = min(_op1.str(),_op2.str());
+        this->op2 = max(_op1.str(),_op2.str());
         this->opcode = _op;
 
         switch (_op) {
@@ -50,54 +50,55 @@ struct my_exp {
     }
 
     string getExp() const {
-        return op1 + " " + op + " " + op2 + "\n";
+        return this->op1 + " " + this->op + " " + this->op2;
     }
 
-
     friend bool operator<(const my_exp &a, const my_exp &b) {
-        return a.opcode < b.opcode;
+        return a.getExp() < b.getExp();
+    }
+
+    friend bool operator==(const my_exp &a, const my_exp &b) {
+        return a.getExp() == b.getExp();
     }
 };
 
 namespace {
-    struct LivenessAnalysis : public FunctionPass {
+    struct AvailableAnalysis : public FunctionPass {
         string func_name = "test";
         static char ID;
 
-        LivenessAnalysis() : FunctionPass(ID) {}
+        AvailableAnalysis() : FunctionPass(ID) {}
 
         bool runOnFunction(Function &F) override {
-            errs() << "Liveness Analysis Pass: ";
-            errs() << F.getName() << "\n";
+            errs() << "AvailExpression: "<< F.getName() << "\n";
             /*
             IN[B]: Expressions available at B’s entry.
             OUT[B]: Expressions available at B’s exit.
             GEN[B]: Expressions computed within B that are available at the end of B.
             KILL[B]: Expressions whose operands are redefined in B.
              */
-            std::map<const BasicBlock *, std::vector<const struct my_exp *>> GEN;
-            std::map<const BasicBlock *, std::vector<const struct my_exp *>> KILL;
-            std::map<const BasicBlock *, std::vector<const struct my_exp *>> IN;
-            std::map<const BasicBlock *, std::vector<const struct my_exp *>> OUT;
+            std::set<const struct my_exp > allEXP;
+            std::map<const BasicBlock *, std::set<const struct my_exp >> GEN;
+            std::map<const BasicBlock *, std::set<const struct my_exp >> KILL;
+            std::map<const BasicBlock *, std::set<const struct my_exp >> IN;
+            std::map<const BasicBlock *, std::set<const struct my_exp >> OUT;
 
             // i_xx -> a/b/c/d/...
             std::map<StringRef, StringRef> REF;
 
             for (auto &basic_block: F) {
                 auto &gen = GEN[&basic_block];
-                auto &kill = KILL[&basic_block];
-
                 for (const auto &inst: basic_block) {
                     //travers instructions
-                    // use by +, -, *, /, br
+                    // use by +, -, *, /
                     if (inst.getOpcode() == Instruction::Add || inst.getOpcode() == Instruction::Sub
                         || inst.getOpcode() == Instruction::Mul || inst.getOpcode() == Instruction::SDiv) {
                         auto op1 = REF[inst.getOperand(0)->getName()];
                         auto op2 = REF[inst.getOperand(1)->getName()];
                         auto op = inst.getOpcode();
                         auto *_exp = new my_exp(op1, op, op2);
-                        gen.push_back(_exp);
-
+                        gen.insert(*_exp);
+                        allEXP.insert(*_exp);
                     } else if (inst.getOpcode() == Instruction::Load) {
                         auto a = dyn_cast_or_null<Value>(&inst);
                         if (!a) {
@@ -106,26 +107,44 @@ namespace {
                         auto i_name = a->getName();
                         auto Var_name = inst.getOperand(0)->getName();
                         REF[i_name] = Var_name;
-                    } else if (inst.getOpcode() == Instruction::Store) {
+                    }
+                } // end of all inst
+            //errs()<<"\n\n";
+            }//end of all blocks
+            for (auto &basic_block: F) {
+                auto &kill = KILL[&basic_block];
+                for (const auto &inst: basic_block) {
+                    if (inst.getOpcode() == Instruction::Store) {
                         auto re_var = inst.getOperand(1)->getName().str();
                         //errs()<<"re defined here  "<<re_var<<"\n";
-                        for (auto _exp: gen) {
-                            if (_exp->op1 == re_var || _exp->op2 == re_var) {
-                                kill.push_back(_exp);
+                        for (auto _exp: allEXP) {
+                            //errs() << _exp->op1 << _exp->op2 <<"KILLing??";
+                            if (_exp.op1 == re_var || _exp.op2 == re_var) {
+                                //errs() << re_var << "KILLing";
+                                kill.insert(_exp);
                             }
                         }
                     }
                 }
+            } //end of 2nd bb loop
 
-            }//end of all blocks
             /*
              -- Initialize sets:
             IN[Bs] = φ;   OUT[Bs] = GEN[Bs];
             for every block B ≠ Bs
                 OUT[B] = All Expressions;
             */
-
-
+            int bb_counter = 0;
+            for (auto &basic_block: F) {
+                bb_counter ++;
+                auto &gen = GEN[&basic_block];
+                auto &out = OUT[&basic_block];
+                if(bb_counter == 1){
+                    std::copy(gen.begin(),gen.end(),std::inserter(out,out.begin()));
+                }else{
+                    std::copy(allEXP.begin(),allEXP.end(),std::inserter(out,out.begin()));
+                }
+            }
 
             /*
             -- Iteratively solve equations:
@@ -140,24 +159,73 @@ namespace {
                 }
             }
             */
-
+            const auto &bbs = F.getBasicBlockList();
+            bool change = true;
+            while(change){
+                change = false;
+                for(auto it = bbs.begin(); it!=bbs.end();it++) {
+                    auto &bb = *it;
+                    auto old_out = OUT[&bb];
+                    OUT[&bb].clear();IN[&bb].clear();
+                    auto &in = IN[&bb];
+                    set<const my_exp> new_in;
+                    auto &new_out = OUT[&bb];
+                    auto kill = KILL[&bb];
+                    auto gen = GEN[&bb];
+                    //                IN[B] =    p ε pred(B) OUT[P]
+                    int pred_count = 0;
+                    for(const BasicBlock *pred : llvm::predecessors(&bb)){
+                        pred_count++;
+                        auto pred_out = OUT[pred];
+                        if(pred_count==1){
+                            std::copy(pred_out.begin(), pred_out.end(),std::inserter(in, in.begin()));
+                        }else{
+                            std::set_intersection(pred_out.begin(), pred_out.end(),
+                                                  in.begin(), in.end(), std::inserter(new_in, new_in.begin()));
+                            in.clear();
+                            std::copy(new_in.begin(), new_in.end(),std::inserter(in, in.begin()));
+                        }
+                    }// get IN[B]
+                    //                OUT[B] = GEN[B] U (IN[B] – KILL[B])
+                    set<const my_exp> diff;
+                    std::set_difference(in.begin(),in.end(),kill.begin(),kill.end(),
+                                        std::inserter(diff, diff.begin()));
+                    std::set_union(gen.begin(),gen.end(),diff.begin(),diff.end(),
+                                             std::inserter(new_out, new_out.begin()));
+                    if(old_out != new_out){
+                        change = true;
+                    }
+                }
+            }
 
             //print out result
             for (auto &bb: F) {
-                if (GEN.count(&bb)) {
-                    errs() << bb.getName() << " GEN :";
-                    for (auto it: GEN[&bb]) {
-                        errs() << it->getExp();
-                    }
+                errs() << "------"<<bb.getName()<<"-----";
+                /*
+                errs()<< " \nGEN :\n";
+                for (auto it: GEN[&bb]) {
+                    errs() << it.getExp() << " ";
                 }
-                errs() << "\n";
+                errs()<< " \nKILL :\n";
+                for (auto it: KILL[&bb]) {
+                    errs() << it.getExp() << " ";
+                }
+                errs()<< " \nIN :\n";
+                for (auto it: IN[&bb]) {
+                    errs() << it.getExp() << " ";
+                }*/
+                errs()<< " \nAvailable :";
+                for (auto it: OUT[&bb]) {
+                    errs() << it.getExp() << "    ";
+                }
+                errs()<< "\n";
             }
-
+            return true;
         } //end of runonfunction
-    }; // end of struct LivenessAnalysis
+    }; // end of struct AvailableAnalysis
 }  // end of anonymous namespace
 
-char LivenessAnalysis::ID = 0;
-static RegisterPass<LivenessAnalysis> X("LivenessAnalysis", "LivenessAnalysis Pass",
+char AvailableAnalysis::ID = 0;
+static RegisterPass<AvailableAnalysis> X("AvailableAnalysis", "AvailableAnalysis Pass",
                                         false /* Only looks at CFG */,
                                         false /* Analysis Pass */);
